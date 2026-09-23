@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from typing import Any
 
@@ -15,12 +17,14 @@ from pydantic import BaseModel, Field
 
 from .evaluator import Evaluator, Measurement
 from .parser import CalcError, parse_expression
+from .resample import Sample, resample
 from .units import (
     UnitRegistry,
     build_registry,
     dims_equal,
     format_dimension,
     DIMENSIONLESS,
+    DIM_T,
 )
 
 logger = logging.getLogger("engineering_calc")
@@ -112,6 +116,173 @@ def _fraction_to_float(value: Fraction) -> float:
     return float(value)
 
 
+# ---------------------------------------------------------------------------
+# /resample：测量序列重采样
+# ---------------------------------------------------------------------------
+
+MAX_GRID_POINTS = 100_000
+MAX_SAMPLES = 100_000
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class ResampleError(Exception):
+    """重采样请求的语义错误：携带出错字段定位，统一返回 422。"""
+
+    def __init__(self, code: str, message: str, field: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.field = field
+
+
+class DurationIn(BaseModel):
+    value: float = Field(..., description="时长数值，必须为正数")
+    unit: str = Field("s", min_length=1, max_length=32, description="时间单位，缺省为秒 s")
+
+
+class SampleIn(BaseModel):
+    timestamp: str | float = Field(
+        ..., description="ISO 8601 时间戳（无时区按 UTC 处理）或 Unix 秒（数字）")
+    value: float = Field(..., description="测量值")
+    unit: str = Field(..., min_length=1, max_length=32, description="测量单位")
+
+
+class ResampleRequest(BaseModel):
+    samples: list[SampleIn] = Field(..., min_length=1, max_length=MAX_SAMPLES,
+                                    description="测量样本序列（无需按时间排序）")
+    unit: str = Field(..., min_length=1, max_length=32,
+                      description="目标单位：全部样本换算到该单位后输出")
+    step: DurationIn = Field(..., description="固定步长（时间单位）")
+    max_gap: DurationIn = Field(...,
+                                description="最大可插值间隔：相邻样本间隔不超过它才做线性插值")
+
+
+def _field_error_body(code: str, message: str, field: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "field": field}}
+
+
+def _finite_fraction(value: float, field: str) -> Fraction:
+    if isinstance(value, bool) or not math.isfinite(value):
+        raise ResampleError("INVALID_VALUE", "数值必须是有限数", field)
+    return Fraction(str(value))
+
+
+def _datetime_to_epoch(dt: datetime) -> Fraction:
+    """datetime -> 自 Unix 纪元起的秒（精确到微秒）；无时区信息按 UTC。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = dt.astimezone(timezone.utc) - _EPOCH
+    return Fraction(delta.days * 86400 + delta.seconds) + Fraction(delta.microseconds, 10**6)
+
+
+def _epoch_to_iso(seconds: Fraction) -> str:
+    """自 Unix 纪元起的秒 -> ISO 8601（UTC，Z 后缀）。
+
+    网格时刻的分母恒为 2^a*5^b（输入精度与时间单位因子均为十进制），
+    因此小数部分必为有限小数，逐位展开即可精确输出。
+    """
+    whole = seconds.numerator // seconds.denominator
+    frac = seconds - whole
+    base = (_EPOCH + timedelta(seconds=whole)).strftime("%Y-%m-%dT%H:%M:%S")
+    if not frac:
+        return f"{base}Z"
+    digits: list[str] = []
+    while frac and len(digits) < 30:  # 30 位足够覆盖任何十进制时间精度
+        frac *= 10
+        digit = frac.numerator // frac.denominator
+        digits.append(str(digit))
+        frac -= digit
+    return f"{base}.{''.join(digits)}Z"
+
+
+def _parse_timestamp(raw: str | float, field: str) -> Fraction:
+    if isinstance(raw, bool):
+        raise ResampleError("INVALID_TIMESTAMP", "时间戳不能是布尔值", field)
+    if isinstance(raw, (int, float)):
+        if not math.isfinite(raw):
+            raise ResampleError("INVALID_TIMESTAMP", "时间戳必须是有限数", field)
+        return Fraction(str(raw))
+    text = raw.strip()
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise ResampleError(
+            "INVALID_TIMESTAMP",
+            f"无法解析的时间戳 {raw!r}：应为 ISO 8601（如 2026-01-01T00:00:00Z）或 Unix 秒",
+            field,
+        ) from None
+    return _datetime_to_epoch(dt)
+
+
+def _parse_duration(registry: UnitRegistry, duration: DurationIn, field: str,
+                    code: str) -> Fraction:
+    """把 ``{value, unit}`` 时长换算为秒；单位必须是时间量纲且数值为正。"""
+    value = _finite_fraction(duration.value, f"{field}.value")
+    if value <= 0:
+        raise ResampleError(code, f"{field} 必须为正数", f"{field}.value")
+    unit = registry.get(duration.unit)
+    if unit is None:
+        raise ResampleError("UNKNOWN_UNIT", f"未知时间单位 {duration.unit!r}", f"{field}.unit")
+    if unit.dimension != DIM_T:
+        raise ResampleError(
+            "UNIT_DIM_MISMATCH",
+            f"{field} 的单位必须是时间单位，而 {duration.unit!r} 的量纲为 "
+            f"{format_dimension(unit.dimension)}",
+            f"{field}.unit",
+        )
+    return unit.to_si(value)
+
+
+def _build_samples(registry: UnitRegistry, req: ResampleRequest):
+    """校验并归一化样本：量纲一致、时间戳互异、换算到目标单位。"""
+    target = registry.get(req.unit)
+    if target is None:
+        raise ResampleError("UNKNOWN_UNIT", f"未知目标单位 {req.unit!r}", "unit")
+
+    step = _parse_duration(registry, req.step, "step", "INVALID_STEP")
+    max_gap = _parse_duration(registry, req.max_gap, "max_gap", "INVALID_MAX_GAP")
+
+    samples: list[Sample] = []
+    seen: dict[Fraction, int] = {}
+    series_dim: tuple[int, ...] | None = None
+    for i, sample_in in enumerate(req.samples):
+        time = _parse_timestamp(sample_in.timestamp, f"samples[{i}].timestamp")
+        if time in seen:
+            raise ResampleError(
+                "DUPLICATE_TIMESTAMP",
+                f"时间戳与 samples[{seen[time]}] 重复",
+                f"samples[{i}].timestamp",
+            )
+        seen[time] = i
+        unit = registry.get(sample_in.unit)
+        if unit is None:
+            raise ResampleError("UNKNOWN_UNIT", f"未知单位 {sample_in.unit!r}",
+                                f"samples[{i}].unit")
+        if series_dim is None:
+            series_dim = unit.dimension
+        elif not dims_equal(unit.dimension, series_dim):
+            raise ResampleError(
+                "DIMENSION_MISMATCH",
+                f"样本量纲不一致：samples[0] 为 {format_dimension(series_dim)}，"
+                f"而 {sample_in.unit!r} 为 {format_dimension(unit.dimension)}",
+                f"samples[{i}].unit",
+            )
+        value = _finite_fraction(sample_in.value, f"samples[{i}].value")
+        samples.append(Sample(time, unit.to_si(value)))
+
+    assert series_dim is not None  # samples 已约束 min_length=1
+    if not dims_equal(target.dimension, series_dim):
+        raise ResampleError(
+            "UNIT_DIM_MISMATCH",
+            f"目标单位量纲不匹配：样本为 {format_dimension(series_dim)}，"
+            f"而 {req.unit!r} 为 {format_dimension(target.dimension)}",
+            "unit",
+        )
+    converted = [Sample(s.time, target.from_si(s.value)) for s in samples]
+    return converted, target, step, max_gap
+
+
 def create_app() -> FastAPI:
     # 服务就绪前初始化一次内置单位表（lifespan 中仅记录日志）
     registry = build_registry()
@@ -122,8 +293,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="设备工程测量计算 API",
-        description="解析带数值与单位的工程算式，自动传播量纲、换算兼容单位，并校验非法运算。",
-        version="1.0.0",
+        description="解析带数值与单位的工程算式，自动传播量纲、换算兼容单位，并校验非法运算；"
+                    "另提供测量序列重采样（规则网格线性插值 + 缺口保留）。",
+        version="1.1.0",
         lifespan=lifespan,
     )
 
@@ -144,6 +316,11 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(status_code=422,
                             content=_error_body("INVALID_REQUEST", details, None))
+
+    @app.exception_handler(ResampleError)
+    async def resample_error_handler(request: Request, exc: ResampleError):
+        return JSONResponse(status_code=422,
+                            content=_field_error_body(exc.code, exc.message, exc.field))
 
     # ---- 业务路由 ----
     @app.post("/calculate", tags=["calculate"],
@@ -185,6 +362,55 @@ def create_app() -> FastAPI:
             "dimension_text": _dim_text(result.dimension),
         }
 
+    @app.post("/resample", tags=["resample"],
+              summary="测量序列重采样到规则网格", response_model=None)
+    async def resample_measurements(req: ResampleRequest) -> dict[str, Any]:
+        registry = get_registry()
+        samples, target, step, max_gap = _build_samples(registry, req)
+
+        start = min(s.time for s in samples)
+        end = max(s.time for s in samples)
+        grid_count = (end - start) // step + 1
+        if grid_count > MAX_GRID_POINTS:
+            raise ResampleError(
+                "INVALID_STEP",
+                f"步长过小：将生成 {grid_count} 个网格点，超过上限 {MAX_GRID_POINTS}",
+                "step.value",
+            )
+
+        result = resample(samples, step, max_gap)
+        points = [
+            {
+                "timestamp": _epoch_to_iso(p.time),
+                "value": None if p.value is None else _fraction_to_float(p.value),
+                "interpolated": p.interpolated,
+                "missing": p.value is None,
+            }
+            for p in result.points
+        ]
+        gaps = [
+            {
+                "start": _epoch_to_iso(g.start),
+                "end": _epoch_to_iso(g.end),
+                "duration_seconds": _fraction_to_float(g.end - g.start),
+            }
+            for g in result.gaps
+        ]
+        return {
+            "unit": target.name,
+            "dimension": list(target.dimension),
+            "dimension_text": _dim_text(target.dimension),
+            "step_seconds": _fraction_to_float(step),
+            "max_gap_seconds": _fraction_to_float(max_gap),
+            "sample_count": len(samples),
+            "range": {"start": _epoch_to_iso(result.start),
+                      "end": _epoch_to_iso(result.end)},
+            "points": points,
+            "point_count": len(points),
+            "missing_count": sum(1 for p in result.points if p.value is None),
+            "gaps": gaps,
+        }
+
     @app.get("/units", tags=["meta"], summary="列出内置单位")
     async def list_units() -> dict[str, Any]:
         registry = get_registry()
@@ -210,7 +436,7 @@ def create_app() -> FastAPI:
             "service": "engineering-measurement-calc",
             "version": app.version,
             "docs": "/docs",
-            "endpoints": ["/calculate", "/units", "/health"],
+            "endpoints": ["/calculate", "/resample", "/units", "/health"],
         }
 
     return app
